@@ -1,0 +1,1 @@
+"""Pellet burner consumption statistics."""
