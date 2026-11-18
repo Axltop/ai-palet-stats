@@ -115,6 +115,39 @@ function hbarChart(items, { digits = 1, unit = "" } = {}) {
   return svg + "</svg>";
 }
 
+/** Daily kg as bars with the mean temperature as a line (own scale on the right). items: [{date, kg, temp_mean}] */
+function tempChart(items, { height = 220 } = {}) {
+  if (!items.length) return `<p class="muted">No data for this period.</p>`;
+  const W = 720, H = height, left = 44, right = 40, bottom = 26, top = 12;
+  const plotW = W - left - right, plotH = H - top - bottom;
+  const maxKg = niceMax(Math.max(...items.map((i) => i.kg || 0)));
+  const temps = items.map((i) => i.temp_mean).filter((t) => t !== null && t !== undefined);
+  const tLo = temps.length ? Math.floor(Math.min(0, ...temps) / 5) * 5 : 0;
+  const tHi = temps.length ? Math.ceil(Math.max(5, ...temps) / 5) * 5 : 20;
+  const ty = (t) => top + plotH - ((t - tLo) / (tHi - tLo || 1)) * plotH;
+  const slot = plotW / items.length;
+  const barW = Math.max(1, Math.min(24, slot * 0.72));
+  const step = Math.max(1, Math.ceil(items.length / 12));
+  let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img">`;
+  for (let i = 0; i <= 4; i++) {
+    const y = top + plotH - (plotH * i) / 4;
+    svg += `<line class="grid-line" x1="${left}" x2="${W - right}" y1="${y}" y2="${y}"/>`;
+    svg += `<text x="${left - 6}" y="${y + 4}" text-anchor="end">${fmt((maxKg * i) / 4, maxKg < 4 ? 1 : 0)}</text>`;
+    svg += `<text class="temp-axis" x="${W - right + 6}" y="${y + 4}">${fmt(tLo + ((tHi - tLo) * i) / 4, 0)}°</text>`;
+  }
+  let path = "";
+  items.forEach((it, i) => {
+    const x = left + i * slot + (slot - barW) / 2;
+    const h = ((it.kg || 0) / maxKg) * plotH;
+    const tip = `${it.date}: ${fmt(it.kg, 1)} kg${it.temp_mean != null ? `, mean ${fmt(it.temp_mean, 1)} °C` : ", no temperature"}`;
+    svg += `<rect class="bar" x="${x}" y="${top + plotH - h}" width="${barW}" height="${Math.max(h, it.kg ? 1 : 0)}" rx="1"><title>${esc(tip)}</title></rect>`;
+    if (it.temp_mean != null) path += `${path && items[i - 1]?.temp_mean != null ? "L" : "M"}${(x + barW / 2).toFixed(1)},${ty(it.temp_mean).toFixed(1)}`;
+    if (i % step === 0) svg += `<text x="${x + barW / 2}" y="${H - 8}" text-anchor="middle">${esc(it.date.slice(5))}</text>`;
+  });
+  if (path) svg += `<path class="temp-line" d="${path}"/>`;
+  return svg + "</svg>";
+}
+
 // ---------- pages ----------
 
 async function overviewPage(params) {
@@ -239,6 +272,16 @@ async function placeFormPage(id) {
       ${inputField("target_temp_c", "Target temperature (°C)", p.target_temp_c, 'type="number" step="0.5" min="0" max="35"')}
       ${inputField("burner_power_kw", "Burner power (kW)", p.burner_power_kw, 'type="number" step="0.1" min="0"')}
       ${inputField("occupants", "Occupants", p.occupants, 'type="number" min="0" step="1"')}
+      <fieldset class="full coords">
+        <legend>Location, for outdoor temperatures from OpenWeather</legend>
+        ${OPTIONS.weather_enabled ? `<div class="actions"><input id="town" placeholder="Town or village, e.g. Sofia, BG" style="flex:1;min-width:12rem">
+          <button type="button" id="find-town">Find coordinates</button></div><div id="town-results" class="actions"></div>` : ""}
+        <div class="actions">
+          ${inputField("latitude", "Latitude", p.latitude, 'type="number" step="any" min="-90" max="90" placeholder="42.6977"')}
+          ${inputField("longitude", "Longitude", p.longitude, 'type="number" step="any" min="-180" max="180" placeholder="23.3219"')}
+        </div>
+        ${OPTIONS.weather_enabled ? "" : `<p class="hint">Temperatures are off because no OpenWeather API key is set. See the README. You can still enter coordinates now.</p>`}
+      </fieldset>
       <label class="field full">Notes<textarea name="notes">${esc(p.notes || "")}</textarea></label>
       <div class="actions full">
         <button class="primary" type="submit">${id ? "Save changes" : "Add place"}</button>
@@ -246,6 +289,32 @@ async function placeFormPage(id) {
         <span class="error" id="form-error"></span>
       </div>
     </form>`;
+  const findTown = document.getElementById("find-town");
+  if (findTown) {
+    const town = document.getElementById("town");
+    const results = document.getElementById("town-results");
+    const lookup = async () => {
+      results.innerHTML = `<span class="hint">Looking up…</span>`;
+      try {
+        const found = await api("GET", `/api/geocode?q=${encodeURIComponent(town.value)}`);
+        results.innerHTML = found.length
+          ? found.map((r, i) => `<button type="button" class="link" data-i="${i}">${esc([r.name, r.state, r.country].filter(Boolean).join(", "))} (${r.lat}, ${r.lon})</button>`).join("")
+          : `<span class="hint">Nothing found. Try adding the country code, e.g. “Bansko, BG”.</span>`;
+        results.querySelectorAll("button").forEach((b) => {
+          b.onclick = () => {
+            const r = found[b.dataset.i];
+            const form = document.getElementById("place-form");
+            form.latitude.value = r.lat; form.longitude.value = r.lon;
+            results.innerHTML = `<span class="hint">Using ${esc(r.name)}.</span>`;
+          };
+        });
+      } catch (err) {
+        results.innerHTML = `<span class="error">${esc(err.message)}</span>`;
+      }
+    };
+    findTown.onclick = lookup;
+    town.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); lookup(); } };
+  }
   document.getElementById("place-form").onsubmit = async (e) => {
     e.preventDefault();
     try {
@@ -259,7 +328,8 @@ async function placeFormPage(id) {
 }
 
 async function placeDetailPage(id, params) {
-  const [place, all] = await Promise.all([api("GET", `/api/places/${id}`), api("GET", `/api/places/${id}/stats`)]);
+  const [place, all, stock] = await Promise.all([
+    api("GET", `/api/places/${id}`), api("GET", `/api/places/${id}/stats`), api("GET", `/api/places/${id}/stock`)]);
   const season = params.get("season") ?? all.available_seasons.at(-1) ?? "";
   const st = season ? await api("GET", `/api/places/${id}/stats?season=${encodeURIComponent(season)}`) : all;
   const metric = params.get("metric") || "kg";
@@ -285,10 +355,12 @@ async function placeDetailPage(id, params) {
       <div class="actions">
         ${seasonSelect(all.available_seasons, season)}
         <a class="btn primary" href="#/log?place=${id}">+ Log consumption</a>
+        <a class="btn" href="#/storage?place=${id}">+ Bags to storage</a>
         <a class="btn" href="#/places/${id}/edit">Edit</a>
         <button class="danger" id="delete-place">Delete</button>
       </div>
     </div>
+    ${stockLine(stock, id)}
     ${s.entries ? `
     <div class="grid-tight" style="margin-bottom:1rem">
       ${tile("Burned", fmt(s.total_kg, 0), "kg")}
@@ -311,6 +383,13 @@ async function placeDetailPage(id, params) {
     <div class="card"><h2>Per day ${st.daily.length > 120 ? `<span class="muted small">(last 120 days of the period)</span>` : ""}</h2>
       ${barChart(dailyItems, { height: 180, digits: 1, alt: true })}
       <p class="hint">Each bar is what you logged that day. If you log refills every few days, look at the monthly kg / day instead.</p></div>
+    <div class="card" id="weather"></div>
+    ${st.monthly.some((m) => m.temp_mean != null) ? `<div class="card"><h2>Consumption and temperature per month</h2><div class="table-wrap"><table>
+      <thead><tr><th>Month</th><th class="num">kg</th><th class="num">kg / day</th><th class="num">Mean temp</th><th class="num">Degree days</th><th class="num">kg / degree day</th></tr></thead>
+      <tbody>${st.monthly.map((m) => `<tr><td>${esc(monthName(m.month))}</td><td class="num">${fmt(m.kg, 0)}</td><td class="num">${fmt(m.kg_per_day)}</td>
+        <td class="num">${m.temp_mean == null ? "–" : `${fmt(m.temp_mean, 1)} °C`}${m.temp_mean != null && m.days_with_temp < m.days ? ` <span class="muted small">(${m.days_with_temp}/${m.days} d)</span>` : ""}</td>
+        <td class="num">${fmt(m.hdd, 0)}</td><td class="num">${fmt(m.kg_per_hdd, 2)}</td></tr>`).join("")}</tbody></table></div>
+      <p class="hint">kg / degree day is shown for months where every logged day has a temperature. It stays about the same in mild and cold months if the house behaves the same, so it is a fair way to compare winters.</p></div>` : ""}
     <div class="grid">
       <div class="card"><h2>Per season</h2><div class="table-wrap"><table>
         <thead><tr><th>Season</th><th class="num">kg</th><th class="num">kg / day</th><th class="num">kg / m²</th><th class="num">Cost</th><th class="num">Cost / m²</th></tr></thead>
@@ -325,6 +404,20 @@ async function placeDetailPage(id, params) {
     </div>` : `<div class="card empty"><p class="muted">Nothing logged ${season ? "in this season" : "yet"}.</p><a class="btn primary" href="#/log?place=${id}">Log consumption</a></div>`}
     ${entriesTable(entries, false)}`;
 
+  const yesterday = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
+  let from = params.get("from"), to = params.get("to");
+  if (!from || !to) {
+    if (season) {
+      const start = Number(season.split("/")[0]);
+      from = `${start}-07-01`; to = `${start + 1}-06-30`;
+      if (s.first_date && s.first_date > from) from = s.first_date;
+      if (to > yesterday) to = yesterday;
+    } else {
+      from = s.first_date || yesterday.slice(0, 8) + "01"; to = s.last_date && s.last_date < yesterday ? s.last_date : yesterday;
+    }
+    if (from > to) from = to;
+  }
+  weatherCard(place, from, to, season, metric);
   document.getElementById("season").onchange = (e) => go(`#/places/${id}?season=${encodeURIComponent(e.target.value)}&metric=${metric}`);
   document.querySelectorAll("#metric button").forEach((b) => {
     b.onclick = () => go(`#/places/${id}?season=${encodeURIComponent(season)}&metric=${b.dataset.metric}`);
@@ -336,6 +429,80 @@ async function placeDetailPage(id, params) {
     go("#/places");
   };
   bindEntryButtons();
+}
+
+function stockLine(stock, placeId) {
+  if (!stock.since) {
+    return `<p class="hint">Record the bags you buy under <a href="#/storage?place=${placeId}">Storage</a> to see how much is left.</p>`;
+  }
+  const bags = stock.products.filter((p) => p.bags !== null && p.kg !== 0)
+    .map((p) => `${fmt(p.bags, p.bags % 1 ? 1 : 0)} × ${esc(p.brand)}`).join(", ");
+  return `<div class="card stock ${stock.kg < 0 ? "low" : ""}"><strong>In storage: ${fmt(stock.kg, 0)} kg</strong>${bags ? ` <span class="muted">(${bags} bags)</span>` : ""}
+    <span class="muted small">· ${fmt(stock.delivered_kg, 0)} kg put in, ${fmt(stock.burned_kg, 0)} kg burned since ${esc(stock.since)}</span>
+    <a class="btn link" href="#/storage?place=${placeId}">Storage</a></div>`;
+}
+
+async function weatherCard(place, from, to, season, metric) {
+  const el = document.getElementById("weather");
+  const base = `#/places/${place.id}?season=${encodeURIComponent(season)}&metric=${metric}`;
+  const render = (w, busy = "") => {
+    const ready = w.enabled && w.has_location;
+    el.innerHTML = `
+      <div class="page-head" style="margin-bottom:.5rem"><h2 style="margin:0">Outdoor temperature</h2>
+        <form class="actions" id="weather-period">
+          <label class="field">From<input type="date" name="from" value="${esc(from)}" required></label>
+          <label class="field">To<input type="date" name="to" value="${esc(to)}" required></label>
+          <button type="submit">Show</button>
+        </form></div>
+      ${!w.enabled ? `<p class="hint">Add an OpenWeather API key to get daily temperatures. See “Outdoor temperatures” in the README.</p>`
+        : !w.has_location ? `<p class="hint"><a href="#/places/${place.id}/edit">Add this place's location</a> to get its daily temperatures.</p>` : ""}
+      ${ready && w.missing ? `<p class="actions"><button class="primary" id="fetch-weather" ${busy ? "disabled" : ""}>Get ${w.missing} missing day${w.missing === 1 ? "" : "s"} from OpenWeather</button>
+        <span class="hint">${esc(busy) || "Each day is one API call and is saved, so it is only fetched once."}</span></p>` : ""}
+      ${w.days_with_temp ? `
+      <div class="grid-tight" style="margin-bottom:1rem">
+        ${tile("Mean daily temperature", fmt(w.temp_mean, 1), "°C")}
+        ${tile("Coldest / warmest", `${fmt(w.temp_min, 0)} / ${fmt(w.temp_max, 0)}`, "°C")}
+        ${tile("Heating degree days", fmt(w.hdd, 0), "")}
+        ${tile("Burned", fmt(w.kg, 0), "kg")}
+        ${tile("Per day", fmt(w.kg_per_day), "kg")}
+        ${tile("Per degree day", fmt(w.kg_per_hdd, 2), "kg")}
+      </div>
+      ${tempChart(w.daily.slice(-180))}
+      <p class="legend"><span><i style="background:var(--bar)"></i>kg burned per day</span><span><i style="background:var(--temp)"></i>mean temperature (right scale)</span></p>
+      <p class="hint">${w.days_with_temp} of ${w.days} days have a temperature${w.daily.length > 180 ? "; the chart shows the last 180 days" : ""}.
+        Degree days: ${fmt(w.hdd_base, 0)} °C minus the day's mean, for days at ${fmt(w.hdd_threshold, 0)} °C or colder.${w.kg_per_hdd == null ? " kg per degree day appears once every day in the period has a temperature." : ""}</p>`
+        : ready && !w.missing ? `<p class="muted">No past days in this period.</p>` : ""}`;
+    document.getElementById("weather-period").onsubmit = (e) => {
+      e.preventDefault();
+      const d = formData(e.target);
+      go(`${base}&from=${d.from}&to=${d.to}`);
+    };
+    const btn = document.getElementById("fetch-weather");
+    if (btn) btn.onclick = () => fetchAll(w.missing);
+  };
+  const q = `from=${from}&to=${to}`;
+  const fetchAll = async (total) => {
+    let w, done = 0;
+    try {
+      do {
+        render(w || current, `Fetching… ${done} of ${total}`);
+        w = await api("POST", `/api/places/${place.id}/weather/fetch?${q}`);
+        done += w.fetched;
+      } while (w.missing && w.fetched);
+      toast(`Got ${done} day${done === 1 ? "" : "s"} of temperatures`);
+      route();  // reload so the monthly table picks up the new temperatures
+    } catch (err) {
+      render(w || current);
+      el.insertAdjacentHTML("beforeend", `<p class="error">${esc(err.message)}</p>`);
+    }
+  };
+  let current;
+  try {
+    current = await api("GET", `/api/places/${place.id}/weather?${q}`);
+    render(current);
+  } catch (err) {
+    el.innerHTML = `<h2>Outdoor temperature</h2><p class="error">${esc(err.message)}</p>`;
+  }
 }
 
 // The stored cost of an entry, if it differs from what the pellet price would give (a manual override).
@@ -469,6 +636,112 @@ async function logPage(entryId, params) {
   };
 }
 
+async function storagePage(params) {
+  const [places, pellets, stocks, deliveries] = await Promise.all([
+    api("GET", "/api/places"), api("GET", "/api/pellets"), api("GET", "/api/stock"), api("GET", "/api/deliveries")]);
+  if (!places.length) {
+    app.innerHTML = `<div class="card empty"><p>Add a place first, then you can record the bags you put into its storage.</p><a class="btn primary" href="#/places/new">Add place</a></div>`;
+    return;
+  }
+  const editId = params.get("edit");
+  const d = editId ? await api("GET", `/api/deliveries/${editId}`) : {};
+  const placeId = String(d.place_id || params.get("place") || places[0].id);
+  let lastPellet = "";
+  try { lastPellet = localStorage.getItem("lastPellet") || ""; } catch { /* storage unavailable */ }
+  const pelletId = String(d.pellet_id ?? (editId ? "" : (pellets.some((p) => String(p.id) === lastPellet) ? lastPellet : pellets[0]?.id ?? "")));
+  let mode = d.id ? (d.bags !== null && d.pellet_id ? "bags" : "kg") : (pellets.length ? "bags" : "kg");
+
+  app.innerHTML = `
+    <div class="page-head"><div><h1>Storage</h1>
+      <div class="muted">Record the bags you buy or put into storage. What is left is those bags minus what you log as burned from that date on.</div></div></div>
+    <div class="grid-tight" style="margin-bottom:1rem">
+      ${stocks.map((x) => `<a class="tile place-card ${x.kg < 0 ? "low" : ""}" href="#/storage?place=${x.place_id}">
+        <div class="label">${esc(x.name)}</div>
+        <div class="value">${x.since ? fmt(x.kg, 0) : "–"} <span class="unit">kg left</span></div>
+        <div class="small muted">${x.since ? x.products.filter((p) => p.bags !== null && p.kg !== 0).map((p) => `${fmt(p.bags, p.bags % 1 ? 1 : 0)} bags ${esc(p.brand)}`).join("<br>") || "&nbsp;" : "no bags recorded yet"}</div>
+      </a>`).join("")}
+    </div>
+    <form class="card stack" id="delivery-form">
+      <h2 class="full" style="margin:0">${d.id ? "Edit delivery" : "Add bags to storage"}</h2>
+      <label class="field"><span class="req">Place</span><select name="place_id" required>
+        ${places.map((p) => `<option value="${p.id}" ${String(p.id) === placeId ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
+      ${inputField("date", "Date", d.date || today(), 'type="date"', true)}
+      <label class="field">Pellet<select name="pellet_id">
+        <option value="">– not specified –</option>
+        ${pellets.map((p) => `<option value="${p.id}" ${String(p.id) === pelletId ? "selected" : ""}>${esc(p.brand)}${p.name ? " " + esc(p.name) : ""} · ${fmt(p.bag_weight_kg, 0)} kg bag${p.price_per_bag != null ? ` · ${money(p.price_per_bag)}` : ""}</option>`).join("")}
+      </select>${pellets.length ? "" : `<span class="hint"><a href="#/pellets">Add your pellets</a> to enter bags and get costs.</span>`}</label>
+      <label class="field">Amount
+        <span class="actions"><span class="segmented" id="mode"><button type="button" data-mode="bags">Bags</button><button type="button" data-mode="kg">kg</button></span>
+        <input name="amount" type="number" step="any" min="0" required style="flex:1;min-width:6rem" value="${esc(d.id ? (mode === "bags" ? d.bags : d.kg) : "")}"></span></label>
+      ${inputField("cost", "Total paid", costOverride(d, pellets), `type="number" step="0.01" min="0" placeholder="from pellet price"`)}
+      <label class="field full">Notes<input name="notes" value="${esc(d.notes || "")}" placeholder="e.g. shop, delivery, pallet of 65 bags"></label>
+      <div class="full hint" id="preview"></div>
+      <div class="actions full">
+        <button class="primary" type="submit">${d.id ? "Save" : "Add to storage"}</button>
+        ${d.id ? `<a class="btn" href="#/storage?place=${d.place_id}">Cancel</a>` : ""}
+        <span class="error" id="form-error"></span>
+      </div>
+    </form>
+    <div id="deliveries"></div>`;
+
+  const form = document.getElementById("delivery-form");
+  const pelletById = (pid) => pellets.find((p) => String(p.id) === String(pid));
+  const refresh = () => {
+    document.querySelectorAll("#mode button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+    const p = pelletById(form.pellet_id.value);
+    const amt = parseFloat(form.amount.value);
+    let text = "";
+    if (mode === "bags" && !p) text = "Pick a pellet product to enter bags, or switch to kg.";
+    else if (amt > 0) {
+      const kg = mode === "bags" ? amt * p.bag_weight_kg : amt;
+      const cost = form.cost.value !== "" ? parseFloat(form.cost.value) : p && p.price_per_bag != null ? (kg * p.price_per_bag) / p.bag_weight_kg : null;
+      text = `= ${fmt(kg, 1)} kg${cost != null ? ` · ${money(cost)}` : ""}`;
+    }
+    document.getElementById("preview").textContent = text;
+  };
+  document.querySelectorAll("#mode button").forEach((b) => { b.onclick = () => { mode = b.dataset.mode; refresh(); }; });
+  form.oninput = refresh;
+  refresh();
+
+  const showList = () => {
+    const rows = deliveries.filter((x) => String(x.place_id) === form.place_id.value);
+    const name = places.find((p) => String(p.id) === form.place_id.value)?.name || "";
+    document.getElementById("deliveries").innerHTML = `<div class="card"><h2>Bags put into storage · ${esc(name)}</h2>
+      ${rows.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Pellet</th><th class="num">Bags</th><th class="num">kg</th><th class="num">Paid</th><th>Notes</th><th></th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.brand || "–")}</td>
+        <td class="num">${x.bags === null ? "–" : fmt(x.bags, x.bags % 1 ? 1 : 0)}</td><td class="num">${fmt(x.kg, 1)}</td>
+        <td class="num">${money(x.cost)}</td><td class="small muted">${esc(x.notes || "")}</td>
+        <td><a class="btn link" href="#/storage?edit=${x.id}">Edit</a><button class="link danger" data-delete-delivery="${x.id}">Delete</button></td></tr>`).join("")}</tbody>
+      </table></div>` : `<p class="muted">Nothing recorded for this place yet.</p>`}</div>`;
+    document.querySelectorAll("[data-delete-delivery]").forEach((b) => {
+      b.onclick = async () => {
+        if (!confirm("Delete this delivery?")) return;
+        await api("DELETE", `/api/deliveries/${b.dataset.deleteDelivery}`);
+        toast("Delivery deleted");
+        route();
+      };
+    });
+  };
+  form.place_id.addEventListener("change", showList);
+  showList();
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const v = formData(form);
+    const body = { place_id: v.place_id, date: v.date, pellet_id: v.pellet_id || null, notes: v.notes, cost: v.cost };
+    body[mode] = v.amount;
+    try {
+      const saved = await api(d.id ? "PUT" : "POST", d.id ? `/api/deliveries/${d.id}` : "/api/deliveries", body);
+      try { localStorage.setItem("lastPellet", v.pellet_id); } catch { /* ignore */ }
+      toast(`${fmt(saved.kg, 0)} kg ${d.id ? "saved" : "added to storage"}`);
+      go(`#/storage?place=${saved.place_id}`);
+    } catch (err) {
+      document.getElementById("form-error").textContent = err.message;
+    }
+  };
+}
+
 async function pelletsPage(params) {
   const pellets = await api("GET", "/api/pellets");
   const editId = params.get("edit");
@@ -543,6 +816,7 @@ async function route() {
     else if (section === "places" && parts[2] === "edit") await placeFormPage(parts[1]);
     else if (section === "places") await placeDetailPage(parts[1], params);
     else if (section === "pellets") await pelletsPage(params);
+    else if (section === "storage") await storagePage(params);
     else if (section === "log") await logPage(parts[1], params);
     else notFound();
   } catch (err) {

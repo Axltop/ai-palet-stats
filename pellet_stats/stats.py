@@ -37,12 +37,75 @@ def filter_season(entries, season):
     return [e for e in entries if season_of(e["date"]) == season]
 
 
-def place_stats(place, entries, season=None):
+# Heating degree days, Eurostat method: a day counts (18 - mean) degrees when its mean is 15 °C or lower.
+HDD_BASE = 18.0
+HDD_THRESHOLD = 15.0
+
+
+def degree_days(mean):
+    if mean is None or mean > HDD_THRESHOLD:
+        return 0.0
+    return HDD_BASE - mean
+
+
+def temperature_summary(temps, entries, start, end):
+    """Mean daily temperature over a period, next to what was burned in it.
+
+    `temps` maps ISO date -> {"temp_mean", "temp_min", "temp_max"} (days may be missing).
+    `entries` are consumption entries; only those dated inside [start, end] count.
+    """
+    start, end = parse_date(start), parse_date(end)
+    total_days = (end - start).days + 1 if end >= start else 0
+    burned = defaultdict(float)
+    for e in entries:
+        d = parse_date(e["date"])
+        if start <= d <= end:
+            burned[d.isoformat()] += e["kg"]
+    daily, means, lows, highs = [], [], [], []
+    hdd = 0.0
+    d = start
+    while d <= end:
+        key = d.isoformat()
+        t = temps.get(key) or {}
+        mean = t.get("temp_mean")
+        if mean is not None:
+            means.append(mean)
+            hdd += degree_days(mean)
+        if t.get("temp_min") is not None:
+            lows.append(t["temp_min"])
+        if t.get("temp_max") is not None:
+            highs.append(t["temp_max"])
+        daily.append({"date": key, "temp_mean": mean, "kg": _round(burned.get(key, 0.0))})
+        d += timedelta(days=1)
+    kg = sum(burned.values())
+    complete = bool(means) and len(means) == total_days
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "days": total_days,
+        "days_with_temp": len(means),
+        "temp_mean": _round(sum(means) / len(means), 1) if means else None,
+        "temp_min": _round(min(lows), 1) if lows else None,
+        "temp_max": _round(max(highs), 1) if highs else None,
+        "hdd": _round(hdd, 1) if means else None,
+        "kg": _round(kg),
+        "kg_per_day": _ratio(kg, total_days),
+        # Only when every day has a temperature, otherwise the ratio would be too high.
+        "kg_per_hdd": _ratio(kg, hdd, 3) if complete else None,
+        "hdd_base": HDD_BASE,
+        "hdd_threshold": HDD_THRESHOLD,
+        "daily": daily,
+    }
+
+
+def place_stats(place, entries, season=None, temps=None):
     """Statistics for one place.
 
     `place` is a dict with at least area_m2 and ceiling_height_m.
     `entries` are dicts with date (ISO string), kg, cost (may be None) and brand (may be None).
     Each entry is the amount of pellets burned (loaded into the burner) on that date.
+    `temps` (optional) maps ISO date -> cached daily temperatures, adding mean temperature and
+    degree days to each month.
     """
     all_seasons = sorted({season_of(e["date"]) for e in entries})
     entries = sorted(filter_season(entries, season), key=lambda e: e["date"])
@@ -101,7 +164,13 @@ def place_stats(place, entries, season=None):
         month_start, month_end = date(y, mo, 1), date(y, mo, monthrange(y, mo)[1])
         # Only count days inside the logged period, so a half-logged first month is not diluted.
         active_days = (min(month_end, last) - max(month_start, first)).days + 1
+        weather = {}
+        if temps is not None:
+            t = temperature_summary(temps, [], max(month_start, first), min(month_end, last))
+            weather = {"temp_mean": t["temp_mean"], "hdd": t["hdd"], "days_with_temp": t["days_with_temp"],
+                       "kg_per_hdd": _ratio(v["kg"], t["hdd"], 3) if t["days_with_temp"] == active_days else None}
         monthly_series.append({
+            **weather,
             "month": key,
             "kg": _round(v["kg"]),
             "cost": _round(v["cost"]),
