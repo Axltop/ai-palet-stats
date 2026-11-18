@@ -70,7 +70,35 @@ CREATE TABLE IF NOT EXISTS entries (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS entries_place_date ON entries(place_id, date);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    place_id INTEGER NOT NULL REFERENCES places(id) ON DELETE CASCADE,
+    pellet_id INTEGER REFERENCES pellets(id) ON DELETE SET NULL,
+    date TEXT NOT NULL,
+    bags REAL,
+    kg REAL NOT NULL,
+    cost REAL,
+    brand TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS deliveries_place_date ON deliveries(place_id, date);
+CREATE TABLE IF NOT EXISTS weather_days (
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    date TEXT NOT NULL,
+    temp_mean REAL,
+    temp_min REAL,
+    temp_max REAL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (lat, lon, date)
+);
 """
+
+# Columns added after the first release. connect() adds them to older databases.
+MIGRATIONS = {
+    "places": {"latitude": "REAL", "longitude": "REAL"},
+}
 
 PLACE_FIELDS = {
     # name: (type, required)
@@ -85,8 +113,12 @@ PLACE_FIELDS = {
     "target_temp_c": (float, False),
     "burner_power_kw": (float, False),
     "occupants": (int, False),
+    "latitude": (float, False),
+    "longitude": (float, False),
     "notes": (str, False),
 }
+# Numbers that may be negative, with their allowed range.
+RANGES = {"latitude": (-90, 90), "longitude": (-180, 180)}
 PELLET_FIELDS = {
     "brand": (str, True),
     "name": (str, False),
@@ -112,6 +144,12 @@ def connect(path):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    for table, columns in MIGRATIONS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    conn.commit()
     return conn
 
 
@@ -134,7 +172,11 @@ def _clean(data, fields, partial=False):
             value = kind(value)
         except (TypeError, ValueError):
             raise ValidationError(f"'{key}' must be a {'number' if kind is not str else 'text'}")
-        if kind in (int, float) and value < 0:
+        if key in RANGES:
+            low, high = RANGES[key]
+            if not low <= value <= high:
+                raise ValidationError(f"'{key}' must be between {low} and {high}")
+        elif kind in (int, float) and value < 0:
             raise ValidationError(f"'{key}' cannot be negative")
         if key in ENUMS and value not in ENUMS[key]:
             raise ValidationError(f"'{key}' must be one of: {', '.join(ENUMS[key])}")
@@ -347,3 +389,116 @@ def update_entry(conn, entry_id, data):
 
 def delete_entry(conn, entry_id):
     return _delete(conn, "entries", entry_id)
+
+
+# Deliveries (bags put into storage) ----------------------------------------
+# A delivery has the same shape as a consumption entry: place, date, pellet, bags or kg, cost.
+
+def list_deliveries(conn, place_id=None):
+    sql = "SELECT d.*, p.name AS place_name FROM deliveries d JOIN places p ON p.id = d.place_id"
+    args = []
+    if place_id:
+        sql += " WHERE d.place_id = ?"
+        args.append(int(place_id))
+    sql += " ORDER BY d.date DESC, d.id DESC"
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def get_delivery(conn, delivery_id):
+    return _get(conn, "deliveries", delivery_id)
+
+
+def create_delivery(conn, data):
+    return get_delivery(conn, _insert(conn, "deliveries", _clean_entry(conn, data)))
+
+
+def update_delivery(conn, delivery_id, data):
+    existing = get_delivery(conn, delivery_id)
+    if not existing:
+        return None
+    _update(conn, "deliveries", delivery_id, _clean_entry(conn, data, existing))
+    return get_delivery(conn, delivery_id)
+
+
+def delete_delivery(conn, delivery_id):
+    return _delete(conn, "deliveries", delivery_id)
+
+
+def stock(conn, place_id):
+    """What is left in storage for a place: bags put into storage minus pellets burned.
+
+    Burning is only counted from the date of the first delivery, so entries logged before
+    you started recording deliveries do not make the stock negative.
+    """
+    first = conn.execute("SELECT MIN(date) FROM deliveries WHERE place_id = ?", (place_id,)).fetchone()[0]
+    if not first:
+        return {"since": None, "delivered_kg": 0, "burned_kg": 0, "kg": 0, "products": []}
+    rows = {}
+
+    def bucket(pellet_id, brand):
+        key = pellet_id or f"brand:{brand or ''}"
+        return rows.setdefault(key, {"pellet_id": pellet_id, "brand": brand or "Unspecified",
+                                     "delivered_kg": 0.0, "burned_kg": 0.0, "bag_weight_kg": None})
+
+    for r in conn.execute(
+        "SELECT pellet_id, brand, SUM(kg) AS kg FROM deliveries WHERE place_id = ? GROUP BY pellet_id, brand",
+        (place_id,),
+    ):
+        bucket(r["pellet_id"], r["brand"])["delivered_kg"] += r["kg"]
+    for r in conn.execute(
+        """SELECT pellet_id, brand, SUM(kg) AS kg FROM entries
+           WHERE place_id = ? AND date >= ? GROUP BY pellet_id, brand""",
+        (place_id, first),
+    ):
+        bucket(r["pellet_id"], r["brand"])["burned_kg"] += r["kg"]
+
+    products = []
+    for row in rows.values():
+        pellet = get_pellet(conn, row["pellet_id"]) if row["pellet_id"] else None
+        kg = row["delivered_kg"] - row["burned_kg"]
+        weight = pellet["bag_weight_kg"] if pellet else None
+        products.append({
+            **row,
+            "bag_weight_kg": weight,
+            "kg": round(kg, 2),
+            "bags": round(kg / weight, 1) if weight else None,
+            "delivered_kg": round(row["delivered_kg"], 2),
+            "burned_kg": round(row["burned_kg"], 2),
+        })
+    products.sort(key=lambda p: -p["kg"])
+    delivered = sum(p["delivered_kg"] for p in products)
+    burned = sum(p["burned_kg"] for p in products)
+    return {
+        "since": first,
+        "delivered_kg": round(delivered, 2),
+        "burned_kg": round(burned, 2),
+        "kg": round(delivered - burned, 2),
+        "products": products,
+    }
+
+
+# Weather cache ------------------------------------------------------------
+# Daily temperatures are stored per location (rounded to about 1 km) so each day is fetched once.
+
+def _loc(lat, lon):
+    return round(float(lat), 2), round(float(lon), 2)
+
+
+def get_temperatures(conn, lat, lon, start, end):
+    lat, lon = _loc(lat, lon)
+    rows = conn.execute(
+        """SELECT date, temp_mean, temp_min, temp_max FROM weather_days
+           WHERE lat = ? AND lon = ? AND date BETWEEN ? AND ? ORDER BY date""",
+        (lat, lon, str(start), str(end)),
+    ).fetchall()
+    return {r["date"]: dict(r) for r in rows}
+
+
+def save_temperature(conn, lat, lon, day, mean, low, high):
+    lat, lon = _loc(lat, lon)
+    conn.execute(
+        """INSERT OR REPLACE INTO weather_days (lat, lon, date, temp_mean, temp_min, temp_max)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (lat, lon, str(day), mean, low, high),
+    )
+    conn.commit()

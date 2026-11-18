@@ -6,12 +6,13 @@ import io
 import json
 import mimetypes
 import re
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlparse
 
-from . import db, stats
+from . import db, stats, weather
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -20,9 +21,38 @@ class NotFound(Exception):
     pass
 
 
-def make_app(conn):
-    """Return a function (method, path, query, body) -> (status, content_type, payload)."""
+def make_app(conn, weather_client=None):
+    """Return a function (method, path, query, body) -> (status, content_type, payload).
+
+    `weather_client` is a weather.OpenWeather (or a stand-in in tests); None turns temperatures off.
+    """
     lock = Lock()
+
+    def coords(place):
+        if place.get("latitude") is None or place.get("longitude") is None:
+            return None
+        return place["latitude"], place["longitude"]
+
+    def period(q):
+        try:
+            start = date.fromisoformat(q.get("from", ""))
+            end = date.fromisoformat(q.get("to", ""))
+        except ValueError:
+            raise db.ValidationError("'from' and 'to' must look like YYYY-MM-DD")
+        if end < start:
+            raise db.ValidationError("'to' must not be before 'from'")
+        if (end - start).days > 3 * 366:
+            raise db.ValidationError("pick a period of three years or less")
+        return start, end
+
+    def weather_report(place, start, end):
+        loc = coords(place)
+        report = {"enabled": weather_client is not None, "has_location": loc is not None, "missing": 0}
+        temps = db.get_temperatures(conn, *loc, start, end) if loc else {}
+        report.update(stats.temperature_summary(temps, entries_for(place["id"]), start, end))
+        if loc:
+            report["missing"] = len(weather.missing_days(conn, *loc, start, end))
+        return report
 
     def entries_for(place_id):
         return db.list_entries(conn, place_id=place_id)
@@ -48,6 +78,7 @@ def make_app(conn):
             "insulation_types": db.INSULATION_TYPES,
             "climate_zones": db.CLIMATE_ZONES,
             "pellet_grades": db.PELLET_GRADES,
+            "weather_enabled": weather_client is not None,
         }
 
     @route("GET", r"/api/places")
@@ -74,7 +105,66 @@ def make_app(conn):
     @route("GET", r"/api/places/(\d+)/stats")
     def places_stats(q, body, pid):
         place = found(db.get_place(conn, int(pid)))
-        return stats.place_stats(place, entries_for(place["id"]), q.get("season"))
+        entries = entries_for(place["id"])
+        temps = None
+        if coords(place) and entries:
+            dates = [e["date"] for e in entries]
+            temps = db.get_temperatures(conn, *coords(place), min(dates), max(dates))
+        return stats.place_stats(place, entries, q.get("season"), temps)
+
+    @route("GET", r"/api/places/(\d+)/weather")
+    def places_weather(q, body, pid):
+        place = found(db.get_place(conn, int(pid)))
+        return weather_report(place, *period(q))
+
+    @route("POST", r"/api/places/(\d+)/weather/fetch")
+    def places_weather_fetch(q, body, pid):
+        place = found(db.get_place(conn, int(pid)))
+        start, end = period(q)
+        if weather_client is None:
+            raise db.ValidationError("no OpenWeather API key is set, see the README")
+        if not coords(place):
+            raise db.ValidationError("add the place's latitude and longitude first")
+        result = weather.fetch_missing(conn, weather_client, *coords(place), start, end)
+        return {**weather_report(place, start, end), "fetched": result["fetched"]}
+
+    @route("GET", r"/api/geocode")
+    def geocode(q, body):
+        if weather_client is None:
+            raise db.ValidationError("no OpenWeather API key is set, see the README")
+        if not (q.get("q") or "").strip():
+            raise db.ValidationError("type a town or city")
+        return weather_client.geocode(q["q"].strip())
+
+    @route("GET", r"/api/stock")
+    def stock_all(q, body):
+        return [{"place_id": p["id"], "name": p["name"], **db.stock(conn, p["id"])} for p in db.list_places(conn)]
+
+    @route("GET", r"/api/places/(\d+)/stock")
+    def places_stock(q, body, pid):
+        found(db.get_place(conn, int(pid)))
+        return db.stock(conn, int(pid))
+
+    @route("GET", r"/api/deliveries")
+    def deliveries_list(q, body):
+        return db.list_deliveries(conn, place_id=q.get("place_id"))
+
+    @route("POST", r"/api/deliveries")
+    def deliveries_create(q, body):
+        return 201, db.create_delivery(conn, body)
+
+    @route("GET", r"/api/deliveries/(\d+)")
+    def deliveries_get(q, body, did):
+        return found(db.get_delivery(conn, int(did)))
+
+    @route("PUT", r"/api/deliveries/(\d+)")
+    def deliveries_update(q, body, did):
+        return found(db.update_delivery(conn, int(did), body))
+
+    @route("DELETE", r"/api/deliveries/(\d+)")
+    def deliveries_delete(q, body, did):
+        found(db.delete_delivery(conn, int(did)))
+        return {"deleted": True}
 
     @route("GET", r"/api/compare")
     def compare(q, body):
@@ -147,6 +237,8 @@ def make_app(conn):
                     return 400, "application/json", {"error": str(exc)}
                 except NotFound:
                     return 404, "application/json", {"error": "not found"}
+                except weather.WeatherError as exc:
+                    return 502, "application/json", {"error": str(exc)}
                 if isinstance(result, tuple) and len(result) == 3:
                     return result
                 if isinstance(result, tuple):
@@ -219,13 +311,17 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--demo", action="store_true", help="fill an empty database with sample data")
+    parser.add_argument("--openweather-key", help="OpenWeather API key (or set OPENWEATHER_API_KEY)")
     args = parser.parse_args(argv)
 
     conn = db.connect(args.db)
     if args.demo:
         from .demo import seed
         print("Demo data:", seed(conn))
-    Handler.app = staticmethod(make_app(conn))
+    key = weather.find_api_key(args.openweather_key)
+    client = weather.OpenWeather(key) if key else None
+    print("OpenWeather temperatures:", "on" if client else "off (set OPENWEATHER_API_KEY to turn them on)")
+    Handler.app = staticmethod(make_app(conn, client))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Pellet stats running at http://{args.host}:{args.port}  (database: {args.db})")
     try:
